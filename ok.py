@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # success.devtools
-# Selenium flow: product -> add to cart -> checkout -> fill -> place order -> wait success (never auto-exit)
+# Fixed: robust filling for email/phone/name + force checkout + wait-for-success + keep process alive
 # Usage:
 #   pip install selenium webdriver-manager
 #   python success.devtools
@@ -48,9 +48,32 @@ def make_driver(headless=HEADLESS):
     driver.set_window_size(1200, 1000)
     return driver
 
-# ====== helpers (مختصرة ومجربة) ======
+# ====== helpers ======
+def close_common_overlays(driver):
+    # try to close cookie banners / overlays that may block inputs
+    selectors = [
+        "//button[contains(.,'أوافق') or contains(.,'قبول') or contains(.,'Accept')]", 
+        "//button[contains(.,'إغلاق') or contains(.,'اغلاق') or contains(.,'Close')]",
+        "//*[contains(@class,'modal-close') or contains(@class,'cookie') or contains(@class,'close') or contains(@class,'accept')]"
+    ]
+    for sel in selectors:
+        try:
+            elems = driver.find_elements(By.XPATH, sel)
+            for e in elems:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", e)
+                    try:
+                        e.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", e)
+                    time.sleep(0.4)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
 def try_set_quantity(driver, qty):
-    xps = ["//input[@type='number']", "//input[contains(@name,'qty') or contains(@name,'quantity') or contains(@id,'qty')]", "//input[@name='quantity']"]
+    xps = ["//input[@type='number']", "//input[contains(@name,'qty') or contains(@name,'quantity') or contains(@id,'qty') or contains(@id,'quantity')]","//input[@name='quantity']"]
     for xp in xps:
         try:
             el = WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.XPATH, xp)))
@@ -77,10 +100,12 @@ def try_set_quantity(driver, qty):
     return False
 
 def click_add_to_cart(driver):
-    candidates = ["//button[contains(normalize-space(.),'أضف إلى السلة') or contains(.,'Add to cart') or contains(.,'أضف')]",
-                  "//a[contains(.,'add to cart') or contains(.,'أضف')]",
-                  "//input[@type='submit' and (contains(@value,'أضف') or contains(@value,'Add'))]",
-                  "//*[contains(@class,'add-to-cart') or contains(@data-action,'add-to-cart')]"]
+    candidates = [
+        "//button[contains(normalize-space(.),'أضف إلى السلة') or contains(.,'Add to cart') or contains(.,'أضف')]",
+        "//a[contains(.,'add to cart') or contains(.,'أضف')]",
+        "//input[@type='submit' and (contains(@value,'أضف') or contains(@value,'Add'))]",
+        "//*[contains(@class,'add-to-cart') or contains(@data-action,'add-to-cart')]"
+    ]
     for xp in candidates:
         try:
             els = driver.find_elements(By.XPATH, xp)
@@ -130,6 +155,7 @@ def go_to_checkout_from_cart(driver):
 def force_go_to_checkout(driver):
     cur = driver.current_url
     print("➡️ current_url after add:", cur)
+    close_common_overlays(driver)
     # if on cart page, try proceed
     if '/checkout/cart' in cur or '/cart' in cur or 'cart' in cur.lower():
         ok = go_to_checkout_from_cart(driver)
@@ -174,21 +200,181 @@ def force_go_to_checkout(driver):
             pass
         return False
 
-def set_input_by_xpaths(driver, xpaths, value):
-    for xp in xpaths:
+# ---------- robust phone & name fillers ----------
+def robust_set_phone(driver, phone):
+    """Try multiple strategies to set phone (typing, intlTelInput, hidden inputs)."""
+    def dispatch(el):
         try:
-            el = driver.find_element(By.XPATH, xp)
-            driver.execute_script("arguments[0].scrollIntoView();", el)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('input',{bubbles:true}));arguments[0].dispatchEvent(new Event('change',{bubbles:true}));arguments[0].blur();", el)
+        except Exception:
+            pass
+
+    local = phone
+    intl = phone
+    if phone.startswith("0"):
+        intl = "+962" + phone.lstrip("0")
+    else:
+        if not phone.startswith("+"):
+            intl = "+962" + phone.lstrip("0")
+
+    xpath_candidates = [
+        "//input[@type='tel']",
+        "//input[contains(translate(@name,'PHONE','phone'),'phone') or contains(@name,'telephone') or contains(@id,'phone') or contains(@id,'telephone')]",
+        "//input[contains(@class,'phone') or contains(@class,'tel') or contains(@class,'mobile')]",
+        "//input[@placeholder and (contains(@placeholder,'+962') or contains(@placeholder,'رقم') or contains(@placeholder,'Phone'))]",
+        "//input[contains(@class,'iti__input') or contains(@class,'intl') or contains(@class,'intl-tel')]",
+        "//input[@name='telephone' or @name='phone' or @name='telephone_full' or @name='phoneNumber']",
+        "//input[@type='text']"
+    ]
+    # 1) typing into visible inputs
+    for xp in xpath_candidates:
+        try:
+            els = driver.find_elements(By.XPATH, xp)
+        except Exception:
+            els = []
+        for el in els:
+            try:
+                if not el.is_displayed():
+                    continue
+                try: el.click()
+                except Exception: driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                try: el.clear()
+                except Exception: driver.execute_script("arguments[0].value='';", el)
+                cur = ""
+                try: cur = (el.get_attribute("value") or "").strip()
+                except Exception: pass
+                to_type = local
+                if cur.startswith("+962") and local.startswith("0"):
+                    to_type = local.lstrip("0")
+                for ch in to_type:
+                    try: el.send_keys(ch)
+                    except Exception: pass
+                    time.sleep(0.02)
+                dispatch(el)
+                time.sleep(0.25)
+                val = ""
+                try: val = (el.get_attribute("value") or "")
+                except Exception: pass
+                if local.lstrip("0") in val or local in val or "+962" in val or intl in val:
+                    print("✅ تعبئة الهاتف عبر typing ناجح على xp:", xp)
+                    return True
+            except Exception:
+                continue
+    # 2) intlTelInput.setNumber
+    try:
+        js = """
+        var input = document.querySelector('input[type="tel"], input[name*="phone"], input[id*="phone"]');
+        if(window.intlTelInput && input){
+          try{
+            var iti = window.intlTelInputGlobals.getInstance(input);
+            if(iti && iti.setNumber){
+              iti.setNumber(arguments[0]);
+              input.dispatchEvent(new Event('input',{bubbles:true}));
+              input.dispatchEvent(new Event('change',{bubbles:true}));
+              return true;
+            }
+          }catch(e){ return 'err:'+e.toString(); }
+        }
+        return false;
+        """
+        res = driver.execute_script(js, intl)
+        if res:
+            print("✅ تعبئة الهاتف عبر intlTelInput.setNumber نجحت")
+            return True
+    except Exception:
+        pass
+    # 3) hidden inputs
+    try:
+        js_hidden = """
+        var inputs = Array.from(document.querySelectorAll('input[name*=\"phone\"], input[name*=\"telephone\"], input[id*=\"phone\"], input[id*=\"telephone\"], input[name*=\"telephone_full\"], input[name*=\"phoneNumber\"]'));
+        if(inputs.length){
+          inputs.forEach(function(i){ i.value = arguments[0]; i.dispatchEvent(new Event('input',{bubbles:true})); i.dispatchEvent(new Event('change',{bubbles:true})); });
+          return inputs.length;
+        }
+        return 0;
+        """
+        cnt = driver.execute_script(js_hidden, intl)
+        if cnt and int(cnt) > 0:
+            print("✅ ضبطنا حقول الهاتف المخفية عبر JS (count):", cnt)
+            return True
+    except Exception:
+        pass
+    # 4) contenteditable fallback
+    try:
+        js_ce = """
+        var el = Array.from(document.querySelectorAll('[contenteditable=\"true\"], [role=\"combobox\"], [role=\"textbox\"]')).find(e=> (e.innerText||'').match(/\\d{3}/));
+        if(el){
+          el.focus();
+          el.innerText = arguments[0];
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+          el.dispatchEvent(new Event('change',{bubbles:true}));
+          return true;
+        }
+        return false;
+        """
+        res2 = driver.execute_script(js_ce, local)
+        if res2:
+            print("✅ تعبئة الهاتف عبر contenteditable نجحت")
+            return True
+    except Exception:
+        pass
+    print("❌ فشل تعبئة الهاتف تلقائياً")
+    return False
+
+def robust_set_name(driver, full_name):
+    parts = full_name.strip().split()
+    first = parts[0] if parts else full_name
+    last = " ".join(parts[1:]) if len(parts) > 1 else ""
+    tried = [
+        (["//input[@name='firstname']", "//input[@id='firstname']", "//input[contains(@name,'first')]"], first),
+        (["//input[@name='lastname']", "//input[@id='lastname']", "//input[contains(@name,'last')]"], last),
+        (["//input[@name='fullname']", "//input[contains(@name,'full') or contains(@id,'fullname') or contains(@placeholder,'الاسم الكامل')]"], full_name),
+        (["//input[@name='name']", "//input[contains(@id,'name') or contains(@placeholder,'الاسم') or contains(@placeholder,'Name')]"], full_name)
+    ]
+    any_ok = False
+    for xpaths, val in tried:
+        if not val:
+            continue
+        for xp in xpaths:
+            try:
+                el = driver.find_element(By.XPATH, xp)
+                if el and el.is_displayed():
+                    try: el.click()
+                    except Exception: pass
+                    try: el.clear()
+                    except Exception: driver.execute_script("arguments[0].value='';", el)
+                    el.send_keys(val)
+                    try:
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('input',{bubbles:true})); arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", el)
+                    except Exception:
+                        pass
+                    time.sleep(0.15)
+                    any_ok = True
+                    print("✅ ملأنا الاسم في xp:", xp)
+                    break
+            except Exception:
+                continue
+        if any_ok:
+            break
+    # fallback placeholder
+    if not any_ok:
+        try:
+            el = driver.find_element(By.XPATH, "//input[contains(@placeholder,'الاسم') or contains(@placeholder,'Name') or contains(@placeholder,'الاسم الكامل')]")
             try: el.clear()
             except Exception: driver.execute_script("arguments[0].value='';", el)
-            el.send_keys(value)
-            driver.execute_script("arguments[0].dispatchEvent(new Event('input',{bubbles:true})); arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", el)
-            time.sleep(0.2)
-            print("✅ set field via:", xp)
-            return True
+            el.send_keys(full_name)
+            try:
+                driver.execute_script("arguments[0].dispatchEvent(new Event('input',{bubbles:true})); arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", el)
+            except Exception:
+                pass
+            time.sleep(0.15)
+            any_ok = True
+            print("✅ ملأنا الاسم في placeholder-field")
         except Exception:
-            continue
-    return False
+            pass
+    if not any_ok:
+        print("❌ لم نتمكن من ملء الاسم تلقائياً")
+    return any_ok
 
 def ensure_terms_checked(driver, wait_before_click=5, max_attempts=6):
     print(f"⏱️ سننتظر {wait_before_click} ثانية قبل محاولة النقر على مربع الشروط...")
@@ -218,7 +404,6 @@ def ensure_terms_checked(driver, wait_before_click=5, max_attempts=6):
                             return True
                     except Exception:
                         pass
-                    # try JS set checked
                     try:
                         driver.execute_script("arguments[0].checked=true;arguments[0].setAttribute('checked','checked');arguments[0].dispatchEvent(new Event('input',{bubbles:true})); arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", cb)
                         time.sleep(0.3)
@@ -229,7 +414,7 @@ def ensure_terms_checked(driver, wait_before_click=5, max_attempts=6):
                         pass
                 except Exception:
                     continue
-        # click labels
+        # click labels and visual candidates
         for sel in label_text_selectors:
             try:
                 els = driver.find_elements(By.XPATH, sel)
@@ -250,7 +435,6 @@ def ensure_terms_checked(driver, wait_before_click=5, max_attempts=6):
                         pass
                 except Exception:
                     continue
-        # visual candidates
         try:
             visual_candidates = driver.find_elements(By.CSS_SELECTOR, ".custom-checkbox, .fc-checkbox, .checkbox, .agree, .check")
         except Exception:
@@ -276,10 +460,6 @@ def ensure_terms_checked(driver, wait_before_click=5, max_attempts=6):
     return False
 
 def click_place_order_and_wait_success(driver, timeout=90):
-    """
-    يحاول النقر على زر إجراء الطلب ثم ينتظر صفحة النجاح.
-    لا يُغلق السكربت هنا — سيبقى معلقًا حتى تضغط Enter.
-    """
     order_attempts = 6
     clicked = False
     for i in range(order_attempts):
@@ -304,11 +484,9 @@ def click_place_order_and_wait_success(driver, timeout=90):
         if clicked:
             break
         time.sleep(0.8)
-
     if not clicked:
         print("⚠️ لم نتمكن من النقر على زر 'إجراء الطلب' بعد كل المحاولات.")
     else:
-        # بعد النقر: ننتظر صفحة النجاح (timeout بالثواني)
         print(f"⏳ ننتظر حتى {timeout}s لظهور صفحة النجاح ({SUCCESS_URL_PART}) ...")
         try:
             WebDriverWait(driver, timeout).until(EC.url_contains(SUCCESS_URL_PART))
@@ -342,22 +520,36 @@ def main():
         print("إضافة للسلة:", "نجاح" if added else "فشل")
         time.sleep(0.8)
 
-        # إجبار الذهاب للـ checkout (يتعامل مع صفحة العربة أولاً)
         ok_checkout = force_go_to_checkout(driver)
         if not ok_checkout:
             print("❌ checkout لم يُحمل بشكل صحيح — راجع checkout_debug.html أو اطبع لي مخرجات الطرفية.")
-            # لا ننهي السكربت — ننتظر منك تدخل للتشخيص
             input("اضغط Enter عندما تريد أن ننهي السكربت (أو اضغط Ctrl+C)...")
             return
 
-        # ملء الحقول
-        set_input_by_xpaths(driver, ["//input[@id='customer-email']", "//input[@type='email' and contains(@name,'email')]"], EMAIL)
-        set_input_by_xpaths(driver, ["//input[@type='tel']", "//input[contains(@name,'phone') or contains(@id,'phone')]"], PHONE)
-        set_input_by_xpaths(driver, ["//input[@name='firstname']", "//input[@id='firstname']"], FULL_NAME.split()[0] if FULL_NAME else "")
-        if len(FULL_NAME.split())>1:
-            set_input_by_xpaths(driver, ["//input[@name='lastname']", "//input[@id='lastname']"], " ".join(FULL_NAME.split()[1:]))
+        # close overlay then fill fields (robust)
+        close_common_overlays(driver)
+        # Email
+        email_ok = False
+        for _ in range(3):
+            email_ok = set_input_by_xpaths := None
+            try:
+                email_ok = driver.find_element(By.XPATH, "//input[@id='customer-email']")
+                if email_ok:
+                    try:
+                        email_ok.clear()
+                    except Exception:
+                        driver.execute_script("arguments[0].value='';", email_ok)
+                    email_ok.send_keys(EMAIL)
+                    driver.execute_script("arguments[0].dispatchEvent(new Event('input',{bubbles:true})); arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", email_ok)
+                    print("✅ set field via: //input[@id='customer-email']")
+                    break
+            except Exception:
+                time.sleep(0.5)
+        # use robust setters for phone & name
+        phone_ok = robust_set_phone(driver, PHONE)
+        name_ok = robust_set_name(driver, FULL_NAME)
 
-        # اختيار طريقة الدفع (محاولة)
+        # choose payment (best-effort)
         payment_selected = False
         try:
             radios = driver.find_elements(By.XPATH, "//input[@type='radio' and (contains(@name,'payment') or contains(@name,'method'))]")
@@ -383,21 +575,21 @@ def main():
         except Exception:
             pass
 
-        # تأكد الشروط
+        # agree terms
         terms_ok = ensure_terms_checked(driver, wait_before_click=5, max_attempts=6)
         print("الموافقة على الشروط:", "تم" if terms_ok else "لم")
 
-        # اضغط إجراء الطلب وانتظر صفحة النجاح
+        # place order and wait for success
         success = click_place_order_and_wait_success(driver, timeout=90)
         if success:
             print("🎉 تم الوصول إلى صفحة النجاح — العملية نجحت.")
         else:
             print("⚠️ لم نصل لصفحة النجاح تلقائياً — راجع success_debug.html أو الصفحة المفتوحة في المتصفح.")
 
-        # IMPORTANT: لا ننهي السكربت هنا — ننتظرك لتنهيه يدوياً
         print("\n========================")
-        print("السكربت انتهى الإجراءات لكنه سيبقى قيد التشغيل حتى تغلقه يدوياً.")
-        print("- افحص المتصفح المفتوح. إذا تريد إنهاء السكربت الآن، اذهب إلى الطرفية واضغط Enter.")
+        print("السكربت انتهى الإجراءات ولكنه سيبقى قيد التشغيل حتى تغلقه يدوياً.")
+        print("لفحص: افتح المتصفح المفتوح أو اطلع على ملفات debug (checkout_debug.html / success_debug.html).")
+        print("عند الاستعداد لانهاء السكربت اضغط Enter في الطرفية.")
         print("========================\n")
         input("اضغط Enter في الطرفية لإغلاق المتصفح وإنهاء السكربت...")
 
